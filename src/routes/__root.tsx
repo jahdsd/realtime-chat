@@ -77,14 +77,14 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Lovable App" },
-      { name: "description", content: "Lovable Generated Project" },
-      { name: "author", content: "Lovable" },
-      { property: "og:title", content: "Lovable App" },
-      { property: "og:description", content: "Lovable Generated Project" },
+      { title: "Ranvo — Random Video Chat mit Fremden" },
+      { name: "description", content: "Starte in Sekunden einen anonymen Video-Chat mit zufälligen Menschen aus aller Welt. Kostenlos, ohne Anmeldung." },
+      { name: "author", content: "Ranvo" },
+      { property: "og:title", content: "Ranvo — Random Video Chat" },
+      { property: "og:description", content: "Anonymer Video-Chat mit zufälligen Fremden. Kostenlos, ohne Anmeldung." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:site", content: "@Lovable" },
+      { name: "twitter:site", content: "@Ranvo" },
     ],
     links: [
       {
