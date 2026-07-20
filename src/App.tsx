@@ -1,4 +1,3 @@
-import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Video,
@@ -15,10 +14,6 @@ import {
   Users,
   Shield,
 } from "lucide-react";
-
-export const Route = createFileRoute("/")({
-  component: Index,
-});
 
 type Status = "idle" | "searching" | "connected";
 type ChatMsg = { id: number; from: "me" | "stranger" | "system"; text: string };
@@ -37,7 +32,7 @@ const STRANGER_LINES = [
 const COUNTRIES = ["🇩🇪 Deutschland", "🇫🇷 Frankreich", "🇮🇹 Italien", "🇪🇸 Spanien", "🇳🇱 Niederlande", "🇧🇷 Brasilien", "🇯🇵 Japan", "🇺🇸 USA", "🇨🇦 Kanada", "🇬🇧 UK"];
 const NAMES = ["Alex", "Sam", "Jordan", "Robin", "Kai", "Luca", "Mika", "Noa", "Yuki", "River"];
 
-function Index() {
+export default function Index() {
   const [status, setStatus] = useState<Status>("idle");
   const [camOn, setCamOn] = useState(true);
   const [micOn, setMicOn] = useState(true);
