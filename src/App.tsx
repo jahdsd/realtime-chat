@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { io, type Socket } from "socket.io-client";
 import {
   Video,
   VideoOff,
@@ -14,121 +15,268 @@ import {
   Users,
   Shield,
 } from "lucide-react";
+import { ICE_SERVERS, SIGNALING_URL } from "@/lib/signaling";
 
 type Status = "idle" | "searching" | "connected";
 type ChatMsg = { id: number; from: "me" | "stranger" | "system"; text: string };
 
-const STRANGER_LINES = [
-  "hey :)",
-  "wo kommst du her?",
-  "wie geht's?",
-  "was machst du gerade?",
-  "cool, ich mag deinen background",
-  "hast du hobbies?",
-  "hörst du gerade musik?",
-  "spielst du games?",
-];
-
-const COUNTRIES = ["🇩🇪 Deutschland", "🇫🇷 Frankreich", "🇮🇹 Italien", "🇪🇸 Spanien", "🇳🇱 Niederlande", "🇧🇷 Brasilien", "🇯🇵 Japan", "🇺🇸 USA", "🇨🇦 Kanada", "🇬🇧 UK"];
-const NAMES = ["Alex", "Sam", "Jordan", "Robin", "Kai", "Luca", "Mika", "Noa", "Yuki", "River"];
-
-export default function Index() {
+export default function App() {
   const [status, setStatus] = useState<Status>("idle");
   const [camOn, setCamOn] = useState(true);
   const [micOn, setMicOn] = useState(true);
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
-  const [stranger, setStranger] = useState<{ name: string; country: string } | null>(null);
-  const [onlineCount] = useState(() => 12000 + Math.floor(Math.random() * 4000));
+  const [onlineCount, setOnlineCount] = useState<number>(0);
+  const [peerId, setPeerId] = useState<string | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const searchTimer = useRef<number | null>(null);
-  const strangerTimer = useRef<number | null>(null);
+
+  const socketRef = useRef<Socket | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const roomRef = useRef<string | null>(null);
+  const isInitiatorRef = useRef<boolean>(false);
+
+  // ─── Local media ──────────────────────────────────────────────────────
+  const ensureLocalStream = useCallback(async (): Promise<MediaStream> => {
+    if (localStreamRef.current) return localStreamRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localStreamRef.current = stream;
+    if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+    stream.getVideoTracks().forEach((t) => (t.enabled = camOn));
+    stream.getAudioTracks().forEach((t) => (t.enabled = micOn));
+    return stream;
+  }, [camOn, micOn]);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        if (cancelled) {
-          s.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        streamRef.current = s;
-        if (localVideoRef.current) localVideoRef.current.srcObject = s;
-      } catch {
-        // permission denied — continue in demo mode
-      }
-    })();
-    return () => {
-      cancelled = true;
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      if (searchTimer.current) window.clearTimeout(searchTimer.current);
-      if (strangerTimer.current) window.clearTimeout(strangerTimer.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    streamRef.current?.getVideoTracks().forEach((t) => (t.enabled = camOn));
+    localStreamRef.current?.getVideoTracks().forEach((t) => (t.enabled = camOn));
   }, [camOn]);
   useEffect(() => {
-    streamRef.current?.getAudioTracks().forEach((t) => (t.enabled = micOn));
+    localStreamRef.current?.getAudioTracks().forEach((t) => (t.enabled = micOn));
   }, [micOn]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const pickStranger = () => ({
-    name: NAMES[Math.floor(Math.random() * NAMES.length)],
-    country: COUNTRIES[Math.floor(Math.random() * COUNTRIES.length)],
-  });
+  // ─── Peer connection lifecycle ────────────────────────────────────────
+  const teardownPeer = useCallback(() => {
+    if (pcRef.current) {
+      try {
+        pcRef.current.ontrack = null;
+        pcRef.current.onicecandidate = null;
+        pcRef.current.onconnectionstatechange = null;
+        pcRef.current.close();
+      } catch {
+        /* noop */
+      }
+      pcRef.current = null;
+    }
+    remoteStreamRef.current = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    pendingCandidatesRef.current = [];
+    roomRef.current = null;
+    isInitiatorRef.current = false;
+  }, []);
 
-  const scheduleStrangerReply = (delay = 2500) => {
-    if (strangerTimer.current) window.clearTimeout(strangerTimer.current);
-    strangerTimer.current = window.setTimeout(() => {
-      setMessages((m) => [
-        ...m,
-        {
-          id: Date.now(),
-          from: "stranger",
-          text: STRANGER_LINES[Math.floor(Math.random() * STRANGER_LINES.length)],
-        },
-      ]);
-    }, delay);
-  };
+  const createPeer = useCallback(
+    async (initiator: boolean, room: string) => {
+      teardownPeer();
+      roomRef.current = room;
+      isInitiatorRef.current = initiator;
 
-  const connect = (delayMin = 1400, delayVar = 1400) => {
-    setStranger(null);
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      pcRef.current = pc;
+
+      const stream = await ensureLocalStream();
+      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+
+      const remote = new MediaStream();
+      remoteStreamRef.current = remote;
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remote;
+
+      pc.ontrack = (ev) => {
+        ev.streams[0]?.getTracks().forEach((t) => remote.addTrack(t));
+      };
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate && socketRef.current) {
+          socketRef.current.emit("ice-candidate", { room, candidate: ev.candidate.toJSON() });
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (
+          pc.connectionState === "failed" ||
+          pc.connectionState === "disconnected" ||
+          pc.connectionState === "closed"
+        ) {
+          // Let the server-driven "peer-left" event handle re-queueing.
+        }
+      };
+
+      if (initiator) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socketRef.current?.emit("offer", { room, sdp: offer });
+      }
+    },
+    [ensureLocalStream, teardownPeer],
+  );
+
+  // ─── Socket wiring ────────────────────────────────────────────────────
+  const connectSocket = useCallback((): Socket => {
+    if (socketRef.current) return socketRef.current;
+    const socket = io(SIGNALING_URL, {
+      transports: ["websocket", "polling"],
+      autoConnect: true,
+    });
+    socketRef.current = socket;
+
+    socket.on("online-count", (n: number) => setOnlineCount(n));
+
+    socket.on("matched", async ({ room, initiator, peer }: { room: string; initiator: boolean; peer: string }) => {
+      setPeerId(peer);
+      setStatus("connected");
+      setMessages([{ id: Date.now(), from: "system", text: "Du bist mit einem Fremden verbunden" }]);
+      try {
+        await createPeer(initiator, room);
+      } catch (err) {
+        console.error("createPeer failed", err);
+      }
+    });
+
+    socket.on("offer", async ({ sdp }: { sdp: RTCSessionDescriptionInit }) => {
+      const pc = pcRef.current;
+      if (!pc) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      for (const c of pendingCandidatesRef.current) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+        } catch (e) {
+          console.warn("addIceCandidate (drain) failed", e);
+        }
+      }
+      pendingCandidatesRef.current = [];
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit("answer", { room: roomRef.current, sdp: answer });
+    });
+
+    socket.on("answer", async ({ sdp }: { sdp: RTCSessionDescriptionInit }) => {
+      const pc = pcRef.current;
+      if (!pc) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      for (const c of pendingCandidatesRef.current) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(c));
+        } catch (e) {
+          console.warn("addIceCandidate (drain) failed", e);
+        }
+      }
+      pendingCandidatesRef.current = [];
+    });
+
+    socket.on("ice-candidate", async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
+      const pc = pcRef.current;
+      if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) {
+        pendingCandidatesRef.current.push(candidate);
+        return;
+      }
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn("addIceCandidate failed", e);
+      }
+    });
+
+    socket.on("chat-message", ({ text }: { text: string }) => {
+      setMessages((m) => [...m, { id: Date.now(), from: "stranger", text }]);
+    });
+
+    socket.on("peer-left", () => {
+      teardownPeer();
+      setPeerId(null);
+      setMessages((m) => [...m, { id: Date.now(), from: "system", text: "Fremder hat verlassen — suche neuen…" }]);
+      setStatus("searching");
+      socket.emit("find");
+    });
+
+    socket.on("waiting", () => {
+      setStatus("searching");
+    });
+
+    socket.on("disconnect", () => {
+      teardownPeer();
+      setStatus("idle");
+      setPeerId(null);
+    });
+
+    return socket;
+  }, [createPeer, teardownPeer]);
+
+  // ─── User actions ─────────────────────────────────────────────────────
+  const start = useCallback(async () => {
+    try {
+      await ensureLocalStream();
+    } catch (err) {
+      alert("Kamera-/Mikrofon-Zugriff wurde abgelehnt.");
+      console.error(err);
+      return;
+    }
+    setStatus("searching");
+    setMessages([]);
+    const socket = connectSocket();
+    if (socket.connected) socket.emit("find");
+    else socket.once("connect", () => socket.emit("find"));
+  }, [connectSocket, ensureLocalStream]);
+
+  const next = useCallback(() => {
+    const socket = socketRef.current;
+    if (!socket) return;
+    teardownPeer();
+    setPeerId(null);
     setMessages([]);
     setStatus("searching");
-    if (searchTimer.current) window.clearTimeout(searchTimer.current);
-    searchTimer.current = window.setTimeout(() => {
-      const s = pickStranger();
-      setStranger(s);
-      setStatus("connected");
-      setMessages([{ id: Date.now(), from: "system", text: `Du bist mit ${s.name} verbunden` }]);
-      scheduleStrangerReply(1600);
-    }, delayMin + Math.random() * delayVar);
-  };
+    socket.emit("next");
+  }, [teardownPeer]);
 
-  const stop = () => {
-    if (searchTimer.current) window.clearTimeout(searchTimer.current);
-    if (strangerTimer.current) window.clearTimeout(strangerTimer.current);
+  const stop = useCallback(() => {
+    teardownPeer();
+    if (socketRef.current) {
+      socketRef.current.emit("leave");
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    localStreamRef.current = null;
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
     setStatus("idle");
-    setStranger(null);
+    setPeerId(null);
     setMessages([]);
-  };
+  }, [teardownPeer]);
 
-  const send = () => {
+  const send = useCallback(() => {
     const t = input.trim();
-    if (!t || status !== "connected") return;
+    if (!t || status !== "connected" || !socketRef.current) return;
+    socketRef.current.emit("chat-message", { room: roomRef.current, text: t });
     setMessages((m) => [...m, { id: Date.now(), from: "me", text: t }]);
     setInput("");
-    scheduleStrangerReply(1200 + Math.random() * 1800);
-  };
+  }, [input, status]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      teardownPeer();
+      socketRef.current?.disconnect();
+      socketRef.current = null;
+      localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, [teardownPeer]);
+
+  const peerLabel = useMemo(() => (peerId ? peerId.slice(0, 6).toUpperCase() : ""), [peerId]);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -137,9 +285,20 @@ export default function Index() {
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 md:px-6 py-6 md:py-8">
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-4 md:gap-6">
           <section className="flex flex-col gap-4">
-            <div className="relative aspect-video w-full rounded-2xl overflow-hidden glass shadow-glow">
-              <StrangerStage status={status} stranger={stranger} />
+            <div className="relative aspect-video w-full rounded-2xl overflow-hidden glass shadow-glow bg-black">
+              {/* Remote video */}
+              <video
+                ref={remoteVideoRef}
+                autoPlay
+                playsInline
+                className={`absolute inset-0 w-full h-full object-cover ${
+                  status === "connected" ? "opacity-100" : "opacity-0"
+                }`}
+              />
 
+              {status !== "connected" && <Overlay status={status} />}
+
+              {/* Local PiP */}
               <div className="absolute bottom-4 right-4 w-32 md:w-48 aspect-video rounded-xl overflow-hidden border border-border bg-black/60 shadow-lg">
                 <video
                   ref={localVideoRef}
@@ -158,13 +317,13 @@ export default function Index() {
                 </div>
               </div>
 
-              {status === "connected" && stranger && (
+              {status === "connected" && (
                 <div className="absolute top-4 left-4 flex items-center gap-2 glass rounded-full pl-1 pr-3 py-1">
                   <span className="h-6 w-6 rounded-full bg-gradient-brand flex items-center justify-center text-[11px] font-semibold">
-                    {stranger.name[0]}
+                    ?
                   </span>
-                  <span className="text-sm font-medium">{stranger.name}</span>
-                  <span className="text-xs text-muted-foreground">{stranger.country}</span>
+                  <span className="text-sm font-medium">Fremder</span>
+                  <span className="text-xs text-muted-foreground">#{peerLabel}</span>
                   <span className="ml-1 h-2 w-2 rounded-full bg-[var(--success)] animate-pulse" />
                 </div>
               )}
@@ -176,9 +335,9 @@ export default function Index() {
               micOn={micOn}
               onToggleCam={() => setCamOn((v) => !v)}
               onToggleMic={() => setMicOn((v) => !v)}
-              onStart={() => connect()}
+              onStart={start}
               onStop={stop}
-              onNext={() => connect(1200, 1200)}
+              onNext={next}
             />
           </section>
 
@@ -202,7 +361,9 @@ export default function Index() {
                   <p className="text-sm max-w-[240px]">
                     {status === "idle"
                       ? "Klicke auf Start, um jemanden zu treffen."
-                      : "Verbindung wird hergestellt…"}
+                      : status === "searching"
+                        ? "Suche jemanden…"
+                        : "Sag Hallo!"}
                   </p>
                 </div>
               )}
@@ -273,7 +434,7 @@ function Header({ onlineCount }: { onlineCount: number }) {
   );
 }
 
-function StrangerStage({ status, stranger }: { status: Status; stranger: { name: string; country: string } | null }) {
+function Overlay({ status }: { status: Status }) {
   if (status === "idle") {
     return (
       <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-6 gap-4 bg-[var(--surface)]/60">
@@ -281,66 +442,26 @@ function StrangerStage({ status, stranger }: { status: Status; stranger: { name:
           <Play className="h-9 w-9 text-white translate-x-0.5" />
         </div>
         <div className="max-w-md">
-          <h1 className="text-2xl md:text-4xl font-bold tracking-tight">
-            Triff jemanden Neues.
-          </h1>
+          <h1 className="text-2xl md:text-4xl font-bold tracking-tight">Triff jemanden Neues.</h1>
           <p className="mt-2 text-muted-foreground text-sm md:text-base">
-            Ein Klick, ein Fremder, eine Unterhaltung. Anonym, kostenlos, weltweit.
+            Ein Klick, ein Fremder, eine echte Video-Verbindung. Anonym, kostenlos, weltweit.
           </p>
         </div>
       </div>
     );
   }
-  if (status === "searching") {
-    return (
-      <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-[var(--surface)]/70">
-        <SearchingOrbs />
-        <div className="text-center">
-          <div className="text-lg font-semibold">Suche jemanden…</div>
-          <div className="text-sm text-muted-foreground mt-1">
-            Weltweite Nutzer werden gematcht
-          </div>
-        </div>
-      </div>
-    );
-  }
-  return <FakeStrangerVideo seed={stranger?.name ?? "x"} />;
-}
-
-function SearchingOrbs() {
   return (
-    <div className="relative h-24 w-24">
-      <span className="absolute inset-0 rounded-full bg-gradient-brand opacity-70 animate-ping" />
-      <span className="absolute inset-2 rounded-full bg-gradient-brand opacity-90" />
-      <span className="absolute inset-0 flex items-center justify-center">
-        <Globe2 className="h-8 w-8 text-white" />
-      </span>
-    </div>
-  );
-}
-
-function FakeStrangerVideo({ seed }: { seed: string }) {
-  const hue = useMemo(() => {
-    let h = 0;
-    for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) % 360;
-    return h;
-  }, [seed]);
-  return (
-    <div
-      className="absolute inset-0 overflow-hidden"
-      style={{
-        background: `radial-gradient(80% 60% at 30% 30%, hsl(${hue} 70% 55% / 0.9), transparent 60%),
-                     radial-gradient(70% 60% at 70% 70%, hsl(${(hue + 60) % 360} 70% 45% / 0.85), transparent 60%),
-                     linear-gradient(135deg, hsl(${hue} 40% 20%), hsl(${(hue + 40) % 360} 40% 12%))`,
-      }}
-    >
-      <div className="absolute inset-0 flex items-center justify-center">
-        <div className="h-32 w-32 md:h-40 md:w-40 rounded-full bg-white/10 backdrop-blur-xl border border-white/20 flex items-center justify-center text-6xl md:text-7xl font-bold">
-          {seed[0]?.toUpperCase()}
-        </div>
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-[var(--surface)]/70">
+      <div className="relative h-24 w-24">
+        <span className="absolute inset-0 rounded-full bg-gradient-brand opacity-70 animate-ping" />
+        <span className="absolute inset-2 rounded-full bg-gradient-brand opacity-90" />
+        <span className="absolute inset-0 flex items-center justify-center">
+          <Globe2 className="h-8 w-8 text-white" />
+        </span>
       </div>
-      <div className="absolute bottom-4 left-4 text-xs text-white/70 bg-black/30 rounded px-2 py-1">
-        Demo-Video · echte P2P-Verbindung folgt im MVP
+      <div className="text-center">
+        <div className="text-lg font-semibold">Suche jemanden…</div>
+        <div className="text-sm text-muted-foreground mt-1">Weltweite Nutzer werden gematcht</div>
       </div>
     </div>
   );
@@ -382,7 +503,7 @@ function Controls({
             onClick={onStart}
             className="h-12 px-6 rounded-xl bg-gradient-brand text-white font-semibold flex items-center gap-2 shadow-glow transition hover:scale-[1.02]"
           >
-            <Play className="h-4 w-4" /> Start
+            <Play className="h-4 w-4" /> Start Video Chat
           </button>
         )}
         {status !== "idle" && (
@@ -461,8 +582,8 @@ function MessageBubble({ msg }: { msg: ChatMsg }) {
 function FeatureStrip() {
   const items = [
     { icon: Shield, title: "Anonym", desc: "Keine Anmeldung, keine Profile." },
-    { icon: Globe2, title: "Weltweit", desc: "Menschen aus über 100 Ländern." },
-    { icon: Sparkles, title: "Sofort", desc: "In unter 3 Sekunden verbunden." },
+    { icon: Globe2, title: "Weltweit", desc: "P2P direkt zwischen Browsern." },
+    { icon: Sparkles, title: "Sofort", desc: "In Sekunden verbunden." },
   ];
   return (
     <div className="mt-8 grid grid-cols-1 sm:grid-cols-3 gap-3">
